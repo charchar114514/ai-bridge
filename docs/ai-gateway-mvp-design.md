@@ -114,13 +114,14 @@ flowchart LR
     C --> D[规则检测与结构化标签]
     D --> E[内部 Guard Model]
     E --> F[策略引擎]
-    F --> G[敏感数据脱敏]
+    F --> G[Token 化 / PII Vault]
     G -->|允许且已处理的 prompt| H[模型适配器]
     H --> I[外部 LLM Provider]
     I --> H
-    H --> J[输出安全检查与占位符回填]
+    H --> J[响应扫描 / 精确 Token 回填]
     J --> A
-    B -.最小化审计事件.-> K[(审计存储)]
+    B -.脱敏请求与响应审计.-> K[(SQL Server Express Audit)]
+    G -.短期、加密映射.-> M[(PII Vault)]
     F -.策略版本.-> L[(策略配置)]
 ```
 
@@ -132,7 +133,7 @@ flowchart LR
 | 规则检测器 | 识别高确定性字段和读取上游结构化标签 | 正则 + 校验器 + 结构化字段优先 |
 | 内部 Guard Model | 识别自由文本实体、数据组合风险、批量数据/交易明细和 Prompt Injection 等语义风险 | 只部署在受控内部环境；仅返回严格结构化发现结果 |
 | 策略引擎 | 根据调用方、用途、风险等级、数据类型与模型做最终决定 | 配置驱动的 allow/redact/block 规则；不直接信任模型的放行判断 |
-| PII 处理器 | 检测结果对应文本的占位符替换、映射生命周期管理 | 规则命中和经校验的 Guard Model 发现结果共同驱动 |
+| Token 化 / PII Vault | 将检测结果替换为请求级随机 token；将 token→原值映射单独加密、设置 TTL 并限制读取 | 规则命中和经校验的 Guard Model 发现结果共同驱动；不与 Audit 共库/共表 |
 | 模型适配器 | 封装 provider API、超时、错误映射 | 先支持一个供应商/一个模型 |
 | 输出处理器 | 受控回填、输出扫描、拒绝不安全输出 | 只回填本请求已签发的原样 token |
 | 审计模块 | 记录决策与证据，不落原始敏感数据 | 结构化日志/轻量数据库 |
@@ -146,10 +147,11 @@ flowchart LR
    - `allow`：不含受保护数据，或数据类型获准外发；
    - `redact`：替换受保护数据后允许转发；
    - `block`：拒绝请求，不调用外部模型。
-5. 对 `redact` 请求，生成不可预测、仅本请求有效的占位符，例如 `[[AI_GW:person:8f3a]]`，并在受控短期存储中保存映射。
-6. 模型适配器只将脱敏后的消息发送给外部供应商。
-7. 收到响应后，输出处理器先执行基础扫描，再只将响应中**精确匹配**、且由本请求创建的占位符替换为原值。
-8. Gateway 返回结果，写入最小化审计事件，并在 TTL 到期后清除映射。
+5. 对 `redact` 请求，生成不可预测、仅本请求有效的占位符，例如 `[[AI_GW:person:8f3a]]`，并将 token→原值映射写入独立、加密且短生命周期的 PII Vault。
+6. 将脱敏后的请求、策略决定和最小化元数据写入 SQL Server Express Audit；Audit 不保存原始请求或 token 映射。
+7. 模型适配器只将脱敏后的消息发送给外部供应商。
+8. 收到响应后，输出处理器先执行 PII/策略扫描；仅将响应中**精确匹配**、且由本请求创建的占位符替换为原值。未匹配、被改写或伪造的 token 一律不回填。
+9. 将脱敏后的响应、Provider 结果和最小化元数据写入 Audit，返回结果；请求结束或 TTL 到期后删除 PII Vault 映射。
 
 ## 6. Masking / 回填的安全设计
 
@@ -277,6 +279,17 @@ Content-Type: application/json
 被阻断时返回可供调用方处理的稳定错误码，例如 `DATA_EGRESS_BLOCKED`，不在响应中回显敏感原文。
 
 ## 9. 审计与数据边界
+
+### 存储分层与访问边界
+
+| 存储 | 可以保存 | 禁止保存 | 访问方式 |
+| --- | --- | --- | --- |
+| SQL Server Express Audit | `request_id`、调用方、用途、模型/供应商、策略与规则版本、敏感类型/数量、耗时、状态、脱敏请求/响应的 hash 或脱敏副本 | 原始 prompt/response、PII 明文、token→原值映射、供应商密钥 | 仅审计/运维角色按最小权限查询；按保留策略清理 |
+| PII Vault（独立加密短期存储） | 本请求 token→原值映射、类型、`request_id`、过期时间 | 完整审计记录、供应商响应、长期历史映射 | 仅 Gateway 服务身份可在当前请求内读取；禁止人工查询和常规日志访问 |
+
+SQL Server Express 适合作为 MVP 的审计落点，但其单数据库容量上限为 10 GB。因此应从第一天起设置保留期、归档或清理任务、按时间建立索引，并监测容量；当审计量超过该边界时迁移至受控的正式 SQL Server 或集中审计平台。
+
+建议的 `AuditEvent` 最小字段：`Id`、`RequestId`、`OccurredAtUtc`、`TenantId`、`CallerId`、`Purpose`、`Provider`、`Model`、`Decision`、`PolicyVersion`、`RuleIds`、`PiiTypes`、`PiiCount`、`RedactedRequestHash`、`RedactedResponseHash`、`ProviderStatus`、`LatencyMs`、`InputTokens`、`OutputTokens`、`ErrorCode`。其中 `TenantId`、`OccurredAtUtc`、`RequestId` 应建立索引；哈希用于关联和完整性校验，不用于恢复明文。
 
 ### 审计建议记录
 
