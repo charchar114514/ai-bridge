@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# .NET / AI Bridge local build artifacts and package caches
+[Bb]in/
+[Oo]bj/
+.vs/
+.dotnet/
+.dotnet-cli/
+.nuget-packages/
+dotnet-install.ps1
