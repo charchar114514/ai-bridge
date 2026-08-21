@@ -12,5 +12,5 @@ public sealed record ApiError(ErrorBody Error)
 public sealed record ErrorBody(string Code, string Message);
 public sealed record PiiFinding(string Type, int Start, int Length, string Value, int RiskLevel);
 public sealed record PolicyDecision(string Action, string PolicyVersion, string? Reason = null);
-public sealed record GatewayResult(bool Blocked, string? BlockReason, ChatCompletionResponse? Response);
+public sealed record GatewayResult(bool Blocked, string? BlockReason, ChatCompletionResponse? Response, string? ErrorCode = null);
 public sealed record AuditEvent(string RequestId, DateTimeOffset OccurredAtUtc, string CallerId, string Purpose, string Provider, string Model, string Decision, string PolicyVersion, IReadOnlyList<string> PiiTypes, int PiiCount, string RedactedRequestHash, string? RedactedResponseHash, string? TokenizedRequest, string? TokenizedResponse, string ProviderStatus, long LatencyMs, string? ErrorCode);

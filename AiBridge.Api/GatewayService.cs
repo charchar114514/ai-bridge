@@ -69,33 +69,40 @@ public sealed class SqlAuditStore(string connectionString) : IAuditStore
     }
 }
 
-public sealed class GatewayService(IPiiDetector detector, IGuardModel guardModel, IPolicyEngine policy, IPiiVault vault, IExternalLlmProvider provider, IAuditStore audit)
+public sealed class GatewayService(IGuardModel guardModel, IPolicyEngine policy, IPiiVault vault, IExternalLlmProvider provider, IAuditStore audit)
 {
     public async Task<GatewayResult> ProcessAsync(ChatCompletionRequest request, string caller, string purpose, CancellationToken ct)
     {
         if (request.Stream) return new(true, "Streaming is not supported in this MVP.", null);
         var requestId = "gwreq_" + Guid.NewGuid().ToString("N"); var timer = Stopwatch.StartNew();
-        var combined = string.Join('\n', request.Messages.Select(x => x.Content));
-        var ruleFindings = detector.Detect(combined);
-        var guardFindings = await guardModel.DetectAsync(combined, ct);
-        var findings = ruleFindings.Concat(guardFindings)
-            .GroupBy(x => new { x.Type, x.Start, x.Length, x.Value, x.RiskLevel })
-            .Select(x => x.First()).OrderBy(x => x.Start).ToArray();
+        IReadOnlyList<PiiFinding>[] findingsByMessage;
+        try
+        {
+            findingsByMessage = await Task.WhenAll(request.Messages.Select(async x => NormalizeFindings(await guardModel.DetectAsync(x.Content, ct))));
+        }
+        catch (PiiDetectorUnavailableException ex)
+        {
+            await audit.WriteAsync(new(requestId, DateTimeOffset.UtcNow, caller, purpose, provider.Name, request.Model, "block", "mvp-v1", [], 0, Hashing.Sha256("pii-detector-unavailable"), null, null, null, "not_called", timer.ElapsedMilliseconds, "PII_DETECTOR_UNAVAILABLE"), ct);
+            return new(true, ex.Message, null, "PII_DETECTOR_UNAVAILABLE");
+        }
+        var findings = findingsByMessage.SelectMany(x => x)
+            .GroupBy(x => new { x.Type, x.Value, x.RiskLevel })
+            .Select(x => x.First()).ToArray();
         var decision = policy.Decide(caller, purpose, findings);
         if (decision.Action == "block")
         {
             await audit.WriteAsync(new(requestId, DateTimeOffset.UtcNow, caller, purpose, provider.Name, request.Model, "block", decision.PolicyVersion, findings.Select(x => x.Type).Distinct().ToArray(), findings.Length, Hashing.Sha256("blocked"), null, null, null, "not_called", timer.ElapsedMilliseconds, "DATA_EGRESS_BLOCKED"), ct);
             return new(true, decision.Reason ?? "Request blocked by data-egress policy.", null);
         }
-        var sanitizedMessages = request.Messages.Select(message =>
+        var sanitizedMessages = request.Messages.Select((message, index) =>
         {
-            var messageFindings = detector.Detect(message.Content);
+            var messageFindings = findingsByMessage[index];
             return message with { Content = messageFindings.Count == 0 ? message.Content : vault.Tokenize(requestId, message.Content, messageFindings) };
         }).ToArray();
         var sanitized = request with { Messages = sanitizedMessages };
         try
         {
-            var raw = await provider.CompleteAsync(sanitized, ct); var responseFindings = detector.Detect(raw);
+            var raw = await provider.CompleteAsync(sanitized, ct); var responseFindings = await guardModel.DetectAsync(raw, ct);
             var restored = vault.Restore(requestId, raw); var response = new ChatCompletionResponse(requestId, [new(new("assistant", restored))], new(decision.Action, decision.PolicyVersion, findings.Select(x => x.Type).Distinct().ToArray(), true));
             var tokenizedRequest = string.Join('\n', sanitizedMessages.Select(x => x.Content));
             await audit.WriteAsync(new(requestId, DateTimeOffset.UtcNow, caller, purpose, provider.Name, request.Model, decision.Action, decision.PolicyVersion, findings.Select(x => x.Type).Distinct().ToArray(), findings.Length, Hashing.Sha256(tokenizedRequest), Hashing.Sha256(raw), tokenizedRequest, raw, responseFindings.Count == 0 ? "ok" : "response_flagged", timer.ElapsedMilliseconds, null), ct);
@@ -108,5 +115,19 @@ public sealed class GatewayService(IPiiDetector detector, IGuardModel guardModel
             throw;
         }
         finally { vault.Remove(requestId); }
+    }
+
+    private static IReadOnlyList<PiiFinding> NormalizeFindings(IReadOnlyList<PiiFinding> findings)
+    {
+        var selected = new List<PiiFinding>();
+        foreach (var finding in findings
+            .OrderByDescending(x => x.Length)
+            .ThenByDescending(x => x.RiskLevel)
+            .ThenBy(x => x.Type, StringComparer.Ordinal))
+        {
+            var overlaps = selected.Any(existing => finding.Start < existing.Start + existing.Length && existing.Start < finding.Start + finding.Length);
+            if (!overlaps) selected.Add(finding);
+        }
+        return selected.OrderBy(x => x.Start).ToArray();
     }
 }

@@ -6,7 +6,14 @@ builder.Services.AddCors(options => options.AddPolicy("TauriDev", policy => poli
     .AllowAnyHeader()
     .AllowAnyMethod()));
 builder.Services.AddSingleton<IPiiDetector, CompositePiiDetector>();
-builder.Services.AddSingleton<IGuardModel, MockGuardModel>();
+builder.Services.AddHttpClient("PiiDetectEngine", (sp, client) =>
+{
+    client.BaseAddress = new Uri(sp.GetRequiredService<IConfiguration>()["PiiDetector:BaseUrl"] ?? "http://127.0.0.1:8000");
+    // Local GLiNER2 can take longer on its first CPU inference while weights and
+    // kernels warm up. The gateway still fails closed if this timeout is exceeded.
+    client.Timeout = TimeSpan.FromSeconds(60);
+});
+builder.Services.AddSingleton<IGuardModel, LocalPiiEngineGuardModel>();
 builder.Services.AddSingleton<IPolicyEngine, PolicyEngine>();
 builder.Services.AddSingleton<IPiiVault, InMemoryPiiVault>();
 builder.Services.AddSingleton<IExternalLlmProvider>(sp =>
@@ -31,7 +38,7 @@ app.MapPost("/v1/chat/completions", async (ChatCompletionRequest request, HttpRe
 
     var result = await gateway.ProcessAsync(request, caller, purpose, ct);
     return result.Blocked
-        ? Results.Json(ApiError.Create("DATA_EGRESS_BLOCKED", result.BlockReason!), statusCode: StatusCodes.Status403Forbidden)
+        ? Results.Json(ApiError.Create(result.ErrorCode ?? "DATA_EGRESS_BLOCKED", result.BlockReason!), statusCode: result.ErrorCode == "PII_DETECTOR_UNAVAILABLE" ? StatusCodes.Status503ServiceUnavailable : StatusCodes.Status403Forbidden)
         : Results.Ok(result.Response);
 });
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));

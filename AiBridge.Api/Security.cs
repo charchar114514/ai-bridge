@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 
 namespace AiBridge.Api;
@@ -18,17 +19,40 @@ public sealed class CompositePiiDetector : IPiiDetector
     public IReadOnlyList<PiiFinding> Detect(string input) => Rules.SelectMany(rule => rule.Pattern.Matches(input).Select(m => new PiiFinding(rule.Type, m.Index, m.Length, m.Value, rule.Risk))).OrderBy(x => x.Start).ToArray();
 }
 
-// Internal PII-detection LLM boundary. The MVP uses this deterministic mock so no data leaves the process.
 public interface IGuardModel { Task<IReadOnlyList<PiiFinding>> DetectAsync(string input, CancellationToken ct); }
-public sealed class MockGuardModel(IPiiDetector detector) : IGuardModel
+public sealed class PiiDetectorUnavailableException(string message, Exception? inner = null) : Exception(message, inner);
+public sealed class LocalPiiEngineGuardModel(IHttpClientFactory clients) : IGuardModel
 {
-    public Task<IReadOnlyList<PiiFinding>> DetectAsync(string input, CancellationToken ct)
+    public async Task<IReadOnlyList<PiiFinding>> DetectAsync(string input, CancellationToken ct)
     {
-        // Represents the structured JSON that a future internal Guard LLM must return.
-        // It intentionally returns the same known findings as the baseline detector for repeatable tests.
-        IReadOnlyList<PiiFinding> findings = detector.Detect(input);
-        return Task.FromResult(findings);
+        try
+        {
+            var client = clients.CreateClient("PiiDetectEngine");
+            using var response = await client.PostAsJsonAsync("/analyze", new LocalPiiAnalyzeRequest(input, "en", true), ct);
+            response.EnsureSuccessStatusCode();
+            var payload = await response.Content.ReadFromJsonAsync<LocalPiiAnalyzeResponse>(cancellationToken: ct)
+                ?? throw new PiiDetectorUnavailableException("PII Detect Engine returned an empty response.");
+            return payload.Entities
+                .Where(x => x.Start >= 0 && x.End > x.Start && x.End <= input.Length)
+                .Select(x => new PiiFinding(x.Type, x.Start, x.End - x.Start, input[x.Start..x.End], RiskFor(x.Type)))
+                .ToArray();
+        }
+        catch (PiiDetectorUnavailableException) { throw; }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException)
+        {
+            throw new PiiDetectorUnavailableException("Local PII Detect Engine is unavailable; request was not sent to an external model.", ex);
+        }
     }
+
+    private static int RiskFor(string type) => type.ToLowerInvariant() switch
+    {
+        "credential" or "api_key" or "password" or "secret" or "access_token" or "private_key" => 3,
+        "email" => 1,
+        _ => 2,
+    };
+    private sealed record LocalPiiAnalyzeRequest(string Text, string Language, bool IncludeNer);
+    private sealed record LocalPiiAnalyzeResponse(IReadOnlyList<LocalPiiEntity> Entities);
+    private sealed record LocalPiiEntity(string Type, int Start, int End, double Score, string Source);
 }
 
 public interface IPolicyEngine { PolicyDecision Decide(string caller, string purpose, IReadOnlyList<PiiFinding> findings); }
