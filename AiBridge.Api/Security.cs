@@ -66,7 +66,7 @@ public sealed class PolicyEngine : IPolicyEngine
     }
 }
 
-public interface IPiiVault { string Tokenize(string requestId, string input, IReadOnlyList<PiiFinding> findings); string Restore(string requestId, string input); void Remove(string requestId); }
+public interface IPiiVault { string Tokenize(string requestId, string input, IReadOnlyList<PiiFinding> findings); RestoredContent Restore(string requestId, string input); void Remove(string requestId); }
 public sealed class InMemoryPiiVault(IConfiguration configuration) : IPiiVault
 {
     private readonly ConcurrentDictionary<string, VaultEntry> _entries = new();
@@ -87,11 +87,18 @@ public sealed class InMemoryPiiVault(IConfiguration configuration) : IPiiVault
                 previous.Map.Concat(map).ToDictionary(x => x.Key, x => x.Value)));
         return output;
     }
-    public string Restore(string requestId, string input)
+    public RestoredContent Restore(string requestId, string input)
     {
-        if (!_entries.TryGetValue(requestId, out var entry) || entry.ExpiresAt < DateTimeOffset.UtcNow) { _entries.TryRemove(requestId, out _); return input; }
-        foreach (var pair in entry.Map) input = input.Replace(pair.Key, pair.Value, StringComparison.Ordinal);
-        return input;
+        if (!_entries.TryGetValue(requestId, out var entry) || entry.ExpiresAt < DateTimeOffset.UtcNow) { _entries.TryRemove(requestId, out _); return new(input, []); }
+
+        var restoredValues = new List<string>();
+        foreach (var pair in entry.Map)
+        {
+            if (!input.Contains(pair.Key, StringComparison.Ordinal)) continue;
+            input = input.Replace(pair.Key, pair.Value, StringComparison.Ordinal);
+            restoredValues.Add(pair.Value);
+        }
+        return new(input, restoredValues.Distinct(StringComparer.Ordinal).ToArray());
     }
     public void Remove(string requestId) => _entries.TryRemove(requestId, out _);
     private sealed record VaultEntry(DateTimeOffset ExpiresAt, IReadOnlyDictionary<string, string> Map);

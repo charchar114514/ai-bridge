@@ -103,7 +103,7 @@ public sealed class GatewayService(IGuardModel guardModel, IPolicyEngine policy,
         try
         {
             var raw = await provider.CompleteAsync(sanitized, ct); var responseFindings = await guardModel.DetectAsync(raw, ct);
-            var restored = vault.Restore(requestId, raw); var response = new ChatCompletionResponse(requestId, [new(new("assistant", restored))], new(decision.Action, decision.PolicyVersion, findings.Select(x => x.Type).Distinct().ToArray(), true));
+            var restored = vault.Restore(requestId, raw); var response = new ChatCompletionResponse(requestId, [new(new("assistant", restored.Content))], new(decision.Action, decision.PolicyVersion, findings.Select(x => x.Type).Distinct().ToArray(), restored.Values, true));
             var tokenizedRequest = string.Join('\n', sanitizedMessages.Select(x => x.Content));
             await audit.WriteAsync(new(requestId, DateTimeOffset.UtcNow, caller, purpose, provider.Name, request.Model, decision.Action, decision.PolicyVersion, findings.Select(x => x.Type).Distinct().ToArray(), findings.Length, Hashing.Sha256(tokenizedRequest), Hashing.Sha256(raw), tokenizedRequest, raw, responseFindings.Count == 0 ? "ok" : "response_flagged", timer.ElapsedMilliseconds, null), ct);
             return new(false, null, response);
